@@ -2,7 +2,7 @@
 - name: Hello World Playbook for AWX
   hosts: all
   connection: local
-  gather_facts: false
+  gather_facts: true
 
   tasks:
     - name: Print Hello World
