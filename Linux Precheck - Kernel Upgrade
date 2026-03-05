@@ -1,0 +1,268 @@
+---
+- name: Linux Precheck - Kernel Upgrade
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    precheck_log_dir: /var/log/linux-prechecks
+    precheck_run_id: "{{ ansible_date_time.iso8601_basic_short }}"
+    precheck_log_file: "{{ precheck_log_dir }}/precheck_kernel_upgrade_{{ inventory_hostname }}_{{ precheck_run_id }}.log"
+
+    # thresholds (tune as needed)
+    min_boot_free_mb: 300        # /boot free space
+    min_root_free_pct: 10        # / free percent
+    max_load_per_cpu: 2.0        # load avg threshold per CPU core (rough)
+
+  tasks:
+    - name: Ensure log directory exists
+      ansible.builtin.file:
+        path: "{{ precheck_log_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Collect uname -r
+      ansible.builtin.command: uname -r
+      register: uname_r
+      changed_when: false
+
+    - name: Collect last reboot time (who -b)
+      ansible.builtin.command: who -b
+      register: who_b
+      changed_when: false
+      failed_when: false
+
+    - name: Collect uptime
+      ansible.builtin.command: uptime
+      register: uptime_out
+      changed_when: false
+
+    - name: Check /boot disk usage
+      ansible.builtin.command: df -Pm /boot
+      register: df_boot
+      changed_when: false
+      failed_when: false
+
+    - name: Check / root disk usage
+      ansible.builtin.command: df -P /
+      register: df_root
+      changed_when: false
+
+    - name: Check memory (free -m)
+      ansible.builtin.command: free -m
+      register: free_m
+      changed_when: false
+
+    - name: Check load average
+      ansible.builtin.command: cat /proc/loadavg
+      register: loadavg
+      changed_when: false
+
+    - name: Detect package manager
+      ansible.builtin.shell: |
+        set -o pipefail
+        if command -v dnf >/dev/null 2>&1; then echo dnf
+        elif command -v yum >/dev/null 2>&1; then echo yum
+        elif command -v apt-get >/dev/null 2>&1; then echo apt
+        elif command -v zypper >/dev/null 2>&1; then echo zypper
+        elif command -v pacman >/dev/null 2>&1; then echo pacman
+        else echo unknown
+        fi
+      args:
+        executable: /bin/bash
+      register: pkg_mgr
+      changed_when: false
+
+    - name: Check for available updates (lightweight)
+      ansible.builtin.shell: |
+        set -o pipefail
+        case "{{ pkg_mgr.stdout }}" in
+          dnf)
+            dnf -q check-update || true
+            ;;
+          yum)
+            yum -q check-update || true
+            ;;
+          apt)
+            apt-get -qq update >/dev/null
+            apt-get -s upgrade | awk '/^Inst /{count++} END{print "UPDATES="count+0}'
+            ;;
+          zypper)
+            zypper -q refresh >/dev/null
+            zypper -q lu || true
+            ;;
+          pacman)
+            pacman -Sy --noconfirm >/dev/null 2>&1 || true
+            pacman -Qu 2>/dev/null || true
+            ;;
+          *)
+            echo "UPDATES=UNKNOWN"
+            ;;
+        esac
+      args:
+        executable: /bin/bash
+      register: updates_check
+      changed_when: false
+      failed_when: false
+
+    - name: Get installed kernels (best-effort)
+      ansible.builtin.shell: |
+        set -o pipefail
+        if command -v rpm >/dev/null 2>&1; then
+          rpm -qa | egrep -i '^(kernel|kernel-core|linux-image|linux-headers)' | sort || true
+        elif command -v dpkg-query >/dev/null 2>&1; then
+          dpkg-query -W -f='${Package} ${Version}\n' 'linux-image*' 'linux-headers*' 2>/dev/null | sort || true
+        else
+          echo "KERNEL_PKG_LIST_UNAVAILABLE"
+        fi
+      args:
+        executable: /bin/bash
+      register: installed_kernels
+      changed_when: false
+      failed_when: false
+
+    - name: Check if a reboot is likely required (best-effort)
+      ansible.builtin.shell: |
+        set -o pipefail
+        if [ -f /var/run/reboot-required ]; then
+          echo "REBOOT_REQUIRED=true"
+        elif command -v needs-restarting >/dev/null 2>&1; then
+          needs-restarting -r >/dev/null 2>&1 && echo "REBOOT_REQUIRED=false" || echo "REBOOT_REQUIRED=true"
+        else
+          echo "REBOOT_REQUIRED=unknown"
+        fi
+      args:
+        executable: /bin/bash
+      register: reboot_required
+      changed_when: false
+      failed_when: false
+
+    - name: Parse /boot free MB
+      ansible.builtin.set_fact:
+        boot_free_mb: >-
+          {{
+            (
+              (df_boot.stdout_lines[1].split()[3] | int)
+              if (df_boot.stdout_lines is defined and df_boot.stdout_lines|length > 1)
+              else -1
+            )
+          }}
+      when: df_boot.stdout is defined
+      failed_when: false
+
+    - name: Parse / free %
+      ansible.builtin.set_fact:
+        root_free_pct: >-
+          {{
+            (
+              (100 - (df_root.stdout_lines[1].split()[4] | regex_replace('%','') | int))
+              if (df_root.stdout_lines is defined and df_root.stdout_lines|length > 1)
+              else -1
+            )
+          }}
+
+    - name: Parse load per CPU
+      ansible.builtin.set_fact:
+        load_1m: "{{ (loadavg.stdout.split()[0] | float) if loadavg.stdout is defined else 0.0 }}"
+        cpu_cores: "{{ ansible_facts.processor_vcpus | default(ansible_facts.processor_count | default(1)) | int }}"
+        load_per_cpu: "{{ ((loadavg.stdout.split()[0] | float) / (ansible_facts.processor_vcpus | default(ansible_facts.processor_count | default(1)) | int)) if loadavg.stdout is defined else 0.0 }}"
+
+    - name: Build precheck summary
+      ansible.builtin.set_fact:
+        precheck_result:
+          host: "{{ inventory_hostname }}"
+          timestamp: "{{ ansible_date_time.iso8601 }}"
+          os:
+            distro: "{{ ansible_facts.distribution }}"
+            version: "{{ ansible_facts.distribution_version }}"
+            family: "{{ ansible_facts.os_family }}"
+            kernel_running: "{{ uname_r.stdout | default('unknown') }}"
+          package_manager: "{{ pkg_mgr.stdout | default('unknown') }}"
+          reboot_required: "{{ reboot_required.stdout | default('unknown') }}"
+          resources:
+            boot_free_mb: "{{ boot_free_mb | default(-1) }}"
+            root_free_pct: "{{ root_free_pct | default(-1) }}"
+            mem_mb_total: "{{ ansible_facts.memtotal_mb | default('unknown') }}"
+            load_1m: "{{ load_1m }}"
+            cpu_cores: "{{ cpu_cores }}"
+            load_per_cpu: "{{ load_per_cpu }}"
+          checks:
+            boot_space_ok: "{{ (boot_free_mb | default(-1) | int) == -1 or (boot_free_mb | int) >= (min_boot_free_mb | int) }}"
+            root_space_ok: "{{ (root_free_pct | int) >= (min_root_free_pct | int) }}"
+            load_ok: "{{ (load_per_cpu | float) <= (max_load_per_cpu | float) }}"
+          raw:
+            uptime: "{{ uptime_out.stdout | default('') }}"
+            last_reboot: "{{ who_b.stdout | default('') }}"
+            df_boot: "{{ df_boot.stdout | default('') }}"
+            df_root: "{{ df_root.stdout | default('') }}"
+            free_m: "{{ free_m.stdout | default('') }}"
+            updates_check: "{{ updates_check.stdout | default('') }}"
+            installed_kernels: "{{ installed_kernels.stdout | default('') }}"
+
+    - name: Write precheck log on target
+      ansible.builtin.copy:
+        dest: "{{ precheck_log_file }}"
+        content: |
+          === Linux Precheck - Kernel Upgrade ===
+          Host: {{ precheck_result.host }}
+          Timestamp: {{ precheck_result.timestamp }}
+
+          [OS]
+          Distro: {{ precheck_result.os.distro }} {{ precheck_result.os.version }} ({{ precheck_result.os.family }})
+          Running kernel: {{ precheck_result.os.kernel_running }}
+          Package manager: {{ precheck_result.package_manager }}
+          Reboot required: {{ precheck_result.reboot_required }}
+
+          [Resources]
+          /boot free (MB): {{ precheck_result.resources.boot_free_mb }}  (min: {{ min_boot_free_mb }})
+          / free (%):       {{ precheck_result.resources.root_free_pct }} (min: {{ min_root_free_pct }})
+          Mem total (MB):   {{ precheck_result.resources.mem_mb_total }}
+          Load 1m:          {{ precheck_result.resources.load_1m }}
+          CPU cores:        {{ precheck_result.resources.cpu_cores }}
+          Load/CPU:         {{ precheck_result.resources.load_per_cpu }} (max: {{ max_load_per_cpu }})
+
+          [Checks]
+          boot_space_ok: {{ precheck_result.checks.boot_space_ok }}
+          root_space_ok: {{ precheck_result.checks.root_space_ok }}
+          load_ok:       {{ precheck_result.checks.load_ok }}
+
+          [Raw]
+          uptime:
+          {{ precheck_result.raw.uptime }}
+
+          last reboot:
+          {{ precheck_result.raw.last_reboot }}
+
+          df /boot:
+          {{ precheck_result.raw.df_boot }}
+
+          df /:
+          {{ precheck_result.raw.df_root }}
+
+          free -m:
+          {{ precheck_result.raw.free_m }}
+
+          updates check:
+          {{ precheck_result.raw.updates_check }}
+
+          installed kernels:
+          {{ precheck_result.raw.installed_kernels }}
+
+    - name: Expose results to AWX/Controller (set_stats)
+      ansible.builtin.set_stats:
+        data:
+          precheck_kernel_upgrade: "{{ precheck_result }}"
+          precheck_log_file: "{{ precheck_log_file }}"
+        aggregate: false
+
+    - name: Fail if critical checks are not OK
+      ansible.builtin.fail:
+        msg: >-
+          Precheck failed on {{ inventory_hostname }}.
+          boot_space_ok={{ precheck_result.checks.boot_space_ok }},
+          root_space_ok={{ precheck_result.checks.root_space_ok }},
+          load_ok={{ precheck_result.checks.load_ok }}.
+          See log: {{ precheck_log_file }}
+      when: not (precheck_result.checks.boot_space_ok and precheck_result.checks.root_space_ok and precheck_result.checks.load_ok)
