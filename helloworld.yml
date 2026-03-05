@@ -1,0 +1,11 @@
+```yaml
+---
+- name: Hello World Playbook for AWX
+  hosts: all
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Print Hello World
+      ansible.builtin.debug:
+        msg: "Hello World! This AWX job was successfully triggered by n8n. Current Time: {{ ansible_date_time.iso8601 }}"
+```
