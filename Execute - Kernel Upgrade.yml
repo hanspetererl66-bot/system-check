@@ -16,7 +16,6 @@
     reboot_if_needed: true
     apt_cache_valid_time: 3600
 
-  tasks:
     - name: Capture current running kernel before upgrade
       ansible.builtin.command: uname -r
       register: kernel_before
