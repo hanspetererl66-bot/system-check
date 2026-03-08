@@ -1,9 +1,17 @@
 ---
 - name: Kernel upgrade on Ubuntu/Debian target hosts
-  hosts: linux_targets
+  hosts: all
   become: true
   gather_facts: true
 
+  tasks:
+    - name: Show current kernel
+      command: uname -r
+      register: kernel_before
+
+    - name: Print current kernel
+      debug:
+        var: kernel_before.stdout
   vars:
     reboot_if_needed: true
     apt_cache_valid_time: 3600
