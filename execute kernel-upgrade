@@ -1,0 +1,81 @@
+---
+- name: Kernel upgrade on Ubuntu/Debian target hosts
+  hosts: linux_targets
+  become: true
+  gather_facts: true
+
+  vars:
+    reboot_if_needed: true
+    apt_cache_valid_time: 3600
+
+  tasks:
+    - name: Capture current running kernel before upgrade
+      ansible.builtin.command: uname -r
+      register: kernel_before
+      changed_when: false
+
+    - name: Show current kernel before upgrade
+      ansible.builtin.debug:
+        msg: "Current running kernel before upgrade: {{ kernel_before.stdout }}"
+
+    - name: Update apt package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: "{{ apt_cache_valid_time }}"
+
+    - name: Upgrade all installed packages to latest available versions
+      ansible.builtin.apt:
+        upgrade: dist
+      register: apt_upgrade_result
+
+    - name: Ensure latest generic Linux kernel meta-package is installed
+      ansible.builtin.apt:
+        name:
+          - linux-generic
+        state: latest
+      register: kernel_package_result
+
+    - name: Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Capture latest installed kernel package info
+      ansible.builtin.shell: |
+        dpkg -l | grep '^ii' | grep 'linux-image' | awk '{print $2"="$3}' | sort
+      register: installed_kernel_packages
+      changed_when: false
+
+    - name: Show installed kernel packages
+      ansible.builtin.debug:
+        var: installed_kernel_packages.stdout_lines
+
+    - name: Reboot host if required
+      ansible.builtin.reboot:
+        msg: "Reboot triggered by Ansible after kernel upgrade"
+        connect_timeout: 10
+        reboot_timeout: 1800
+        pre_reboot_delay: 5
+        post_reboot_delay: 20
+        test_command: uname -r
+      when:
+        - reboot_if_needed
+        - reboot_required_file.stat.exists
+
+    - name: Capture current running kernel after upgrade
+      ansible.builtin.command: uname -r
+      register: kernel_after
+      changed_when: false
+
+    - name: Show current kernel after upgrade
+      ansible.builtin.debug:
+        msg: "Current running kernel after upgrade: {{ kernel_after.stdout }}"
+
+    - name: Final kernel upgrade summary
+      ansible.builtin.debug:
+        msg:
+          - "Kernel before: {{ kernel_before.stdout }}"
+          - "Kernel after: {{ kernel_after.stdout }}"
+          - "APT packages changed: {{ apt_upgrade_result.changed }}"
+          - "Kernel package changed: {{ kernel_package_result.changed }}"
+          - "Reboot required file existed: {{ reboot_required_file.stat.exists }}"
