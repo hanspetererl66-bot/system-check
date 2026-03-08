@@ -1,5 +1,4 @@
 ---
----
 - name: Kernel upgrade on Ubuntu/Debian target hosts
   hosts: all
   become: true
