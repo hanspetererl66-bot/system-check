@@ -1,0 +1,151 @@
+---
+- name: Kernel dependency scan
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    target_kernel: "{{ target_kernel | default('unknown') }}"
+
+  tasks:
+    - name: Collect package facts
+      package_facts:
+        manager: auto
+
+    - name: Collect service facts
+      service_facts:
+
+    - name: Current running kernel
+      command: uname -r
+      register: uname_result
+      changed_when: false
+
+    - name: Installed kernels (Debian/Ubuntu)
+      shell: "dpkg -l | egrep 'linux-image|linux-headers' || true"
+      register: installed_kernels_deb
+      changed_when: false
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Installed kernels (RHEL/CentOS/Rocky)
+      shell: "rpm -qa | egrep '^kernel|^kernel-core|^kernel-modules' || true"
+      register: installed_kernels_rpm
+      changed_when: false
+      when: ansible_facts['os_family'] == 'RedHat'
+
+    - name: Boot partition usage
+      command: df -h /boot
+      register: boot_df
+      changed_when: false
+      failed_when: false
+
+    - name: DKMS status
+      shell: "dkms status || true"
+      register: dkms_status
+      changed_when: false
+      failed_when: false
+
+    - name: Loaded kernel modules
+      command: lsmod
+      register: lsmod_result
+      changed_when: false
+
+    - name: Multipath status
+      shell: "multipath -ll || true"
+      register: multipath_status
+      changed_when: false
+      failed_when: false
+
+    - name: Block devices
+      command: lsblk -J
+      register: lsblk_result
+      changed_when: false
+
+    - name: Mounts
+      command: mount
+      register: mount_result
+      changed_when: false
+
+    - name: NIC details
+      shell: |
+        set -o pipefail
+        for i in $(ls /sys/class/net | grep -v lo); do
+          echo "### $i"
+          ethtool -i $i 2>/dev/null || true
+        done
+      args:
+        executable: /bin/bash
+      register: nic_details
+      changed_when: false
+      failed_when: false
+
+    - name: Database processes
+      shell: "ps -eo comm,args | egrep 'postgres|mysqld|mariadbd|oracle|hdb|db2sysc' || true"
+      register: db_processes
+      changed_when: false
+
+    - name: Container processes
+      shell: "ps -eo comm,args | egrep 'dockerd|containerd|kubelet|crio' || true"
+      register: container_processes
+      changed_when: false
+
+    - name: Security/monitoring agents
+      shell: "ps -eo comm,args | egrep 'falcon|qualys|trend|crowdstrike|datadog|newrelic|zabbix|telegraf|splunk|elastic-agent' || true"
+      register: agent_processes
+      changed_when: false
+
+    - name: Failed services
+      shell: "systemctl --failed --no-legend || true"
+      register: failed_services
+      changed_when: false
+
+    - name: Journal errors current boot
+      shell: "journalctl -p err -b --no-pager | tail -200 || true"
+      register: journal_errors
+      changed_when: false
+      failed_when: false
+
+    - name: Build normalized report
+      set_fact:
+        kernel_dependency_report:
+          hostname: "{{ inventory_hostname }}"
+          fqdn: "{{ ansible_facts['fqdn'] | default('') }}"
+          system_id: "{{ system_id | default('unknown') }}"
+          os_family: "{{ ansible_facts['os_family'] | default('unknown') }}"
+          distribution: "{{ ansible_facts['distribution'] | default('unknown') }}"
+          distribution_version: "{{ ansible_facts['distribution_version'] | default('unknown') }}"
+          architecture: "{{ ansible_facts['architecture'] | default('unknown') }}"
+          current_kernel: "{{ uname_result.stdout | trim }}"
+          target_kernel: "{{ target_kernel }}"
+          installed_kernels: >-
+            {{
+              (
+                installed_kernels_deb.stdout_lines
+                if (ansible_facts['os_family'] == 'Debian' and installed_kernels_deb is defined)
+                else
+                installed_kernels_rpm.stdout_lines
+                if (ansible_facts['os_family'] == 'RedHat' and installed_kernels_rpm is defined)
+                else []
+              )
+            }}
+          boot_partition: "{{ boot_df.stdout_lines | default([]) }}"
+          dkms_modules: "{{ dkms_status.stdout_lines | default([]) }}"
+          loaded_modules_raw: "{{ lsmod_result.stdout_lines | default([]) }}"
+          multipath_raw: "{{ multipath_status.stdout_lines | default([]) }}"
+          block_devices_json: "{{ (lsblk_result.stdout | from_json) if (lsblk_result.stdout is defined and lsblk_result.stdout|length > 0) else {} }}"
+          mounts_raw: "{{ mount_result.stdout_lines | default([]) }}"
+          nic_details_raw: "{{ nic_details.stdout_lines | default([]) }}"
+          database_processes: "{{ db_processes.stdout_lines | default([]) }}"
+          container_processes: "{{ container_processes.stdout_lines | default([]) }}"
+          agent_processes: "{{ agent_processes.stdout_lines | default([]) }}"
+          failed_services: "{{ failed_services.stdout_lines | default([]) }}"
+          journal_errors: "{{ journal_errors.stdout_lines | default([]) }}"
+
+    - name: Publish report as AWX artifact
+      set_stats:
+        data:
+          kernel_dependency_report: "{{ kernel_dependency_report }}"
+        per_host: false
+
+    - name: Print report summary
+      debug:
+        var: kernel_dependency_report
