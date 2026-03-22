@@ -1,0 +1,87 @@
+---
+- name: Linux Kernel Postcheck
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    expected_kernel_version: "{{ expected_kernel_version | default('') }}"
+
+  tasks:
+
+    - name: Get running kernel version
+      command: uname -r
+      register: running_kernel
+      changed_when: false
+
+    - name: Get last boot information
+      command: who -b
+      register: last_boot
+      changed_when: false
+      failed_when: false
+
+    - name: Get uptime
+      command: uptime
+      register: uptime_info
+      changed_when: false
+
+    - name: Check failed systemd services
+      command: systemctl --failed --no-pager --plain
+      register: failed_services
+      changed_when: false
+      failed_when: false
+
+    - name: Check kernel and system errors from dmesg
+      command: dmesg --level=err,crit,alert,emerg
+      register: dmesg_errors
+      changed_when: false
+      failed_when: false
+
+    - name: Check mounted filesystems
+      command: mount
+      register: mount_info
+      changed_when: false
+
+    - name: Check disk usage
+      command: df -h
+      register: disk_usage
+      changed_when: false
+
+    - name: Check memory usage
+      command: free -h
+      register: memory_info
+      changed_when: false
+
+    - name: Check loaded kernel modules
+      command: lsmod
+      register: kernel_modules
+      changed_when: false
+      failed_when: false
+
+    - name: Determine whether running kernel matches expected kernel
+      set_fact:
+        kernel_match: >-
+          {{
+            (expected_kernel_version | length > 0)
+            and (running_kernel.stdout | trim == expected_kernel_version | trim)
+          }}
+
+    - name: Build structured postcheck result
+      set_fact:
+        postcheck_result:
+          hostname: "{{ inventory_hostname }}"
+          running_kernel: "{{ running_kernel.stdout | default('') }}"
+          expected_kernel_version: "{{ expected_kernel_version }}"
+          kernel_match: "{{ kernel_match }}"
+          last_boot: "{{ last_boot.stdout | default('') }}"
+          uptime: "{{ uptime_info.stdout | default('') }}"
+          failed_services: "{{ failed_services.stdout | default('') }}"
+          dmesg_errors: "{{ dmesg_errors.stdout | default('') }}"
+          mount_info: "{{ mount_info.stdout | default('') }}"
+          disk_usage: "{{ disk_usage.stdout | default('') }}"
+          memory_info: "{{ memory_info.stdout | default('') }}"
+          kernel_modules_sample: "{{ kernel_modules.stdout_lines[:20] | default([]) }}"
+
+    - name: Print postcheck result as JSON
+      debug:
+        msg: "{{ postcheck_result | to_json }}"
